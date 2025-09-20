@@ -1,0 +1,16 @@
+services:
+  mail2cal:
+    image: asyafiqe/mail2cal:0.1
+    container_name: mail2cal
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs:rw
+      - ./google_credentials.json:/app/credentials/google_credentials.json:ro
+      - ./google_token.json:/app/credentials/google_token.json:rw
+    env_file: .env
+    # Optional: enable if you want logs visible in real-time
+    # logging:
+    #   driver: "json-file"
+    #   options:
+    #     max-size: "10m"
+    #     max-file: "3"
