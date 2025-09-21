@@ -816,7 +816,7 @@ class EmailCalendarAutomator:
                 creds.refresh(Request())
             else:
                 flow = InstalledAppFlow.from_client_secrets_file(creds_file, self.GOOGLE_SCOPES)
-                creds = flow.run_local_server(port=0)
+                creds = flow.run_local_server(port=5353, open_browser=False)
             with open(token_file, 'wb') as token:
                 pickle.dump(creds, token)
         service = build('calendar', 'v3', credentials=creds)
