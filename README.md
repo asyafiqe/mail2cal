@@ -30,10 +30,9 @@ The easiest way to run mail2cal is via **Docker** using the pre-built image.
 Create a `docker-compose.yml` file:
 
 ```yaml
-version: '3'
 services:
   mail2cal:
-    image: asyafiqe/mail2cal:0.1
+    image: asyafiqe/mail2cal:latest
     container_name: mail2cal
     restart: unless-stopped
     volumes:
@@ -150,7 +149,7 @@ python mail2cal.py
 
 ---
 
-## 📦 Image Details (`asyafiqe/mail2cal:0.1`)
+## 📦 Image Details (`asyafiqe/mail2cal`)
 
 - Built from Python 3.11
 - Includes required packages: `imaplib`, `caldav`, `google-api-python-client`, `openrouter`, etc.
