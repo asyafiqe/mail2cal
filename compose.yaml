@@ -1,6 +1,6 @@
 services:
   mail2cal:
-    image: asyafiqe/mail2cal:0.1
+    image: asyafiqe/mail2cal:latest
     container_name: mail2cal
     restart: unless-stopped
     volumes:
