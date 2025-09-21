@@ -4,7 +4,7 @@ from email.header import decode_header
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import re
 import time
 import requests
@@ -19,6 +19,8 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import pickle
+from difflib import SequenceMatcher
+import hashlib
 
 # Load environment variables from .env file
 load_dotenv()
@@ -47,6 +49,7 @@ CONFIG = {
     'EVENT_PREFIX': os.getenv('EVENT_PREFIX', ""),
     'ENABLE_CALDAV': os.getenv('ENABLE_CALDAV', 'true').lower() == 'true',
     'ENABLE_GOOGLE_CALENDAR': os.getenv('ENABLE_GOOGLE_CALENDAR', 'true').lower() == 'true',
+    'SIMILARITY_THRESHOLD': float(os.getenv('SIMILARITY_THRESHOLD', '0.7')),  # 70% similarity threshold
 }
 
 # Configure stdout to use UTF-8
@@ -69,9 +72,16 @@ logger = logging.getLogger(__name__)
 class EmailCalendarAutomator:
     def __init__(self):
         self.timezone = pytz.timezone(CONFIG['TIMEZONE'])
-        self.processed_emails = set()  # Track processed emails to avoid duplicates
+        self.processed_emails = set()
         self.google_service = None
         self.caldav_calendar = None
+        # Track created event UIDs to prevent duplicates
+        self.created_event_uids = set()
+        # Caching for performance
+        self._caldav_event_cache = None
+        self._caldav_cache_time = None
+        self._google_event_cache = None
+        self._google_cache_time = None
 
     def initialize_calendars(self):
         """Initialize CalDAV and Google Calendar connections based on configuration"""
@@ -292,37 +302,364 @@ class EmailCalendarAutomator:
             logger.error(f"Failed to call OpenRouter API: {e}")
             return None
 
+    def get_caldav_events(self, calendar):
+        """Retrieve all events from CalDAV calendar with caching"""
+        now = time.time()
+        # Use cache if less than 2 minutes old (more frequent updates)
+        if self._caldav_event_cache and self._caldav_cache_time and (now - self._caldav_cache_time) < 120:
+            return self._caldav_event_cache
+        
+        try:
+            events = calendar.events()
+            parsed_events = []
+            for event in events:
+                try:
+                    ical = Calendar.from_ical(event.data)
+                    for component in ical.walk():
+                        if component.name == "VEVENT":
+                            uid = str(component.get('uid', ''))
+                            # Skip if we've already processed this UID recently
+                            if uid in self.created_event_uids:
+                                continue
+                                
+                            parsed_events.append({
+                                'uid': uid,
+                                'summary': str(component.get('summary', '')),
+                                'start': component.get('dtstart').dt if component.get('dtstart') else None,
+                                'end': component.get('dtend').dt if component.get('dtend') else None,
+                                'location': str(component.get('location', '')),
+                                'description': str(component.get('description', '')),
+                                'raw': component
+                            })
+                except Exception as e:
+                    logger.debug(f"Error parsing CalDAV event: {e}")
+                    continue
+            self._caldav_event_cache = parsed_events
+            self._caldav_cache_time = now
+            return parsed_events
+        except Exception as e:
+            logger.error(f"Error retrieving CalDAV events: {e}")
+            return []
+
+    def get_google_events(self, service, time_min=None, time_max=None):
+        """Retrieve events from Google Calendar with caching"""
+        now = time.time()
+        # Use cache if less than 5 minutes old and no time constraints
+        if not time_min and not time_max and self._google_event_cache and self._google_cache_time and (now - self._google_cache_time) < 300:
+            return self._google_event_cache
+            
+        try:
+            calendar_id = self.get_calendar_id_by_name(service, CONFIG['GOOGLE_CALENDAR_NAME'])
+            # Default to next 365 days if no time range specified
+            if not time_min:
+                time_min = datetime.now(pytz.UTC) - timedelta(days=30)
+            if not time_max:
+                time_max = datetime.now(pytz.UTC) + timedelta(days=335)
+                
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min.isoformat(),
+                timeMax=time_max.isoformat(),
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+            
+            events = events_result.get('items', [])
+            parsed_events = []
+            for event in events:
+                try:
+                    start = event['start'].get('dateTime', event['start'].get('date'))
+                    end = event['end'].get('dateTime', event['end'].get('date'))
+                    
+                    # Parse datetime strings
+                    if 'T' in start:
+                        start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                    else:
+                        start_dt = datetime.fromisoformat(start).date()
+                        
+                    if 'T' in end:
+                        end_dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                    else:
+                        end_dt = datetime.fromisoformat(end).date()
+                        
+                    parsed_events.append({
+                        'id': event.get('id'),
+                        'summary': event.get('summary', ''),
+                        'start': start_dt,
+                        'end': end_dt,
+                        'location': event.get('location', ''),
+                        'description': event.get('description', ''),
+                        'raw': event
+                    })
+                except Exception as e:
+                    logger.debug(f"Error parsing Google event: {e}")
+                    continue
+                    
+            # Update cache only for full calendar fetch
+            if not time_min and not time_max:
+                self._google_event_cache = parsed_events
+                self._google_cache_time = now
+            return parsed_events
+        except Exception as e:
+            logger.error(f"Error retrieving Google events: {e}")
+            return []
+            
+    def is_event_duplicate(self, new_event_data, existing_events):
+        """Check if event already exists in the list of existing events"""
+        for existing_event in existing_events:
+            # Check time overlap first
+            if not self.events_overlap(
+                new_event_data['start_date'], new_event_data['end_date'],
+                existing_event['start'], existing_event['end']
+            ):
+                continue
+                
+            # Check content similarity
+            title_sim = self.calculate_similarity(new_event_data['title'], existing_event['summary'])
+            desc_sim = self.calculate_similarity(new_event_data['description'], existing_event['description'])
+            loc_sim = self.calculate_similarity(new_event_data['location'], existing_event['location'])
+            
+            # If very high similarity, consider it a duplicate
+            if title_sim > 0.9 and desc_sim > 0.8:
+                return True
+                
+        return False
+    def calculate_similarity(self, text1, text2):
+        """Calculate similarity ratio between two texts"""
+        if not text1 and not text2:
+            return 1.0
+        if not text1 or not text2:
+            return 0.0
+        return SequenceMatcher(None, str(text1).lower(), str(text2).lower()).ratio()
+
+    def events_overlap(self, start1, end1, start2, end2):
+        """Check if two time periods overlap"""
+        # Handle date-only events
+        if isinstance(start1, datetime) and isinstance(start2, datetime):
+            return max(start1, start2) < min(end1, end2)
+        elif isinstance(start1, date) and isinstance(start2, date):
+            return max(start1, start2) <= min(end1, end2)
+        # Mixed datetime/date - convert date to datetime
+        else:
+            if isinstance(start1, date) and not isinstance(start1, datetime):
+                start1 = datetime.combine(start1, datetime.min.time()).replace(tzinfo=pytz.UTC)
+            if isinstance(end1, date) and not isinstance(end1, datetime):
+                end1 = datetime.combine(end1, datetime.max.time()).replace(tzinfo=pytz.UTC)
+            if isinstance(start2, date) and not isinstance(start2, datetime):
+                start2 = datetime.combine(start2, datetime.min.time()).replace(tzinfo=pytz.UTC)
+            if isinstance(end2, date) and not isinstance(end2, datetime):
+                end2 = datetime.combine(end2, datetime.max.time()).replace(tzinfo=pytz.UTC)
+            return max(start1, start2) < min(end1, end2)
+
+    def find_similar_events(self, new_event, caldav_events=None, google_events=None):
+        """Find events with >60% similarity in time and content (lowered threshold)"""
+        similar_events = []
+        threshold = 0.6  # Lowered threshold for better detection
+        
+        # Check CalDAV events
+        if CONFIG['ENABLE_CALDAV'] and caldav_events is not None:
+            for event in caldav_events:
+                # Skip if it's the same event we're comparing
+                if hasattr(new_event, 'get') and new_event.get('uid') == event.get('uid'):
+                    continue
+                    
+                # Time overlap check
+                if not self.events_overlap(
+                    new_event['start_date'], new_event['end_date'],
+                    event['start'], event['end']
+                ):
+                    continue
+                    
+                # Content similarity
+                title_sim = self.calculate_similarity(new_event['title'], event['summary'])
+                desc_sim = self.calculate_similarity(new_event['description'], event['description'])
+                loc_sim = self.calculate_similarity(new_event['location'], event['location'])
+                
+                # Weighted similarity (title is most important)
+                overall_sim = (title_sim * 0.5 + desc_sim * 0.3 + loc_sim * 0.2)
+                if overall_sim > threshold:
+                    similar_events.append({
+                        'type': 'caldav',
+                        'event': event,
+                        'similarity': overall_sim
+                    })
+        
+        # Check Google events
+        if CONFIG['ENABLE_GOOGLE_CALENDAR'] and google_events is not None:
+            for event in google_events:
+                # Time overlap check
+                if not self.events_overlap(
+                    new_event['start_date'], new_event['end_date'],
+                    event['start'], event['end']
+                ):
+                    continue
+                    
+                # Content similarity
+                title_sim = self.calculate_similarity(new_event['title'], event['summary'])
+                desc_sim = self.calculate_similarity(new_event['description'], event['description'])
+                loc_sim = self.calculate_similarity(new_event['location'], event['location'])
+                
+                # Weighted similarity
+                overall_sim = (title_sim * 0.5 + desc_sim * 0.3 + loc_sim * 0.2)
+                if overall_sim > threshold:
+                    similar_events.append({
+                        'type': 'google',
+                        'event': event,
+                        'similarity': overall_sim
+                    })
+        
+        return sorted(similar_events, key=lambda x: x['similarity'], reverse=True)
+
+    def update_caldav_event(self, calendar, old_event, new_event_data):
+        """Update an existing CalDAV event with new data"""
+        try:
+            # Get the actual event object from CalDAV, not just the parsed data
+            event_obj = calendar.event_by_uid(old_event['uid'])
+            if not event_obj:
+                logger.warning(f"Event with UID {old_event['uid']} not found in CalDAV calendar")
+                return False
+    
+            # Parse the current iCalendar data
+            cal = Calendar.from_ical(event_obj.data)
+            for component in cal.walk():
+                if component.name == "VEVENT":
+                    # Update fields
+                    component['summary'] = new_event_data['title']
+    
+                    # Handle datetime conversion
+                    start_dt = new_event_data['start_date']
+                    end_dt = new_event_data['end_date']
+                    if isinstance(start_dt, str):
+                        start_dt = datetime.fromisoformat(start_dt.replace('Z', '+00:00'))
+                    if isinstance(end_dt, str):
+                        end_dt = datetime.fromisoformat(end_dt.replace('Z', '+00:00'))
+
+                    # Ensure timezone awareness
+                    if start_dt.tzinfo is None:
+                        start_dt = pytz.UTC.localize(start_dt)
+                    if end_dt.tzinfo is None:
+                        end_dt = pytz.UTC.localize(end_dt)
+
+                    component['dtstart'] = start_dt
+                    component['dtend'] = end_dt
+
+                    if new_event_data.get('location'):
+                        component['location'] = new_event_data['location']
+                    if new_event_data.get('description'):
+                        component['description'] = new_event_data['description']
+
+                    # Update timestamps
+                    component['last-modified'] = datetime.now(pytz.UTC)
+                    break
+
+            # Serialize and save updated event using the existing event's save() method
+            event_obj.data = cal.to_ical()
+            event_obj.save()  # This does PUT and avoids no_overwrite issues
+
+            logger.info(f"Updated CalDAV event: {new_event_data['title']}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update CalDAV event: {e}")
+        return False
+
+    def update_google_event(self, service, old_event, new_event_data):
+        """Update an existing Google Calendar event with new data"""
+        try:
+            calendar_id = self.get_calendar_id_by_name(service, CONFIG['GOOGLE_CALENDAR_NAME'])
+            
+            # Handle datetime conversion
+            start_dt = new_event_data['start_date']
+            end_dt = new_event_data['end_date']
+            
+            if isinstance(start_dt, str):
+                start_dt = datetime.fromisoformat(start_dt.replace('Z', '+00:00'))
+            if isinstance(end_dt, str):
+                end_dt = datetime.fromisoformat(end_dt.replace('Z', '+00:00'))
+                
+            # Prepare update body
+            event_body = {
+                'summary': new_event_data['title'],
+                'start': {
+                    'dateTime': start_dt.isoformat() if isinstance(start_dt, datetime) else start_dt.isoformat(),
+                    'timeZone': CONFIG['TIMEZONE'],
+                },
+                'end': {
+                    'dateTime': end_dt.isoformat() if isinstance(end_dt, datetime) else end_dt.isoformat(),
+                    'timeZone': CONFIG['TIMEZONE'],
+                },
+            }
+            
+            if new_event_data.get('location'):
+                event_body['location'] = new_event_data['location']
+            if new_event_data.get('description'):
+                event_body['description'] = new_event_data['description']
+                
+            # Update the event
+            updated_event = service.events().update(
+                calendarId=calendar_id,
+                eventId=old_event['id'],
+                body=event_body
+            ).execute()
+            
+            logger.info(f"Updated Google Calendar event: {new_event_data['title']}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update Google Calendar event: {e}")
+            return False
+
     def create_calendar_event(self, calendar, event_data):
         """Create calendar event in Radicale"""
         try:
+            # First, check if similar event already exists
+            caldav_events = self.get_caldav_events(calendar)
+            if self.is_event_duplicate(event_data, caldav_events):
+                logger.info(f"Skipping duplicate event creation: {event_data['title']}")
+                return True
+
             cal = Calendar()
             event = Event()
+            
             # Add required properties
             event.add('summary', event_data['title'])
-            # Parse dates
-            start_dt = datetime.fromisoformat(event_data['start_date'].replace('Z', '+00:00'))
-            end_dt = datetime.fromisoformat(event_data['end_date'].replace('Z', '+00:00'))
+            
+            # Handle datetime objects
+            start_dt = event_data['start_date']
+            end_dt = event_data['end_date']
+            
+            if isinstance(start_dt, str):
+                start_dt = datetime.fromisoformat(start_dt.replace('Z', '+00:00'))
+            if isinstance(end_dt, str):
+                end_dt = datetime.fromisoformat(end_dt.replace('Z', '+00:00'))
+                
             # Ensure timezone awareness
             if start_dt.tzinfo is None:
                 start_dt = pytz.UTC.localize(start_dt)
             if end_dt.tzinfo is None:
                 end_dt = pytz.UTC.localize(end_dt)
+                
             event.add('dtstart', start_dt)
             event.add('dtend', end_dt)
+            
             # Add optional properties
             if event_data.get('location'):
                 event.add('location', event_data['location'])
             if event_data.get('description'):
                 event.add('description', event_data['description'])
-            # Add required timestamps and unique ID
-            event.add('dtstamp', datetime.now(pytz.UTC))
-            event.add('created', datetime.now(pytz.UTC))
-            event.add('last-modified', datetime.now(pytz.UTC))
-            # Create unique UID using UUID
+            
+            # Add required timestamps
+            now = datetime.now(pytz.UTC)
+            event.add('dtstamp', now)
+            event.add('created', now)
+            event.add('last-modified', now)
+            
+            # Create unique UID and track it
             event_uid = str(uuid.uuid4())
             event.add('uid', event_uid)
+            self.created_event_uids.add(event_uid)
+            
             # Add to calendar
             cal.add_component(event)
+            
             # Save to CalDAV server
             calendar.save_event(cal.to_ical())
             logger.info(f"Created calendar event: {event_data['title']} at {start_dt}")
@@ -335,7 +672,6 @@ class EmailCalendarAutomator:
         """Process unread emails matching the subject pattern"""
         try:
             mail.select('inbox')
-            # Search for unseen emails with specified subject
             search_criteria = f'(UNSEEN SUBJECT "{CONFIG["SEARCH_SUBJECT"]}")'
             status, messages = mail.search(None, search_criteria)
             if status != 'OK':
@@ -344,14 +680,20 @@ class EmailCalendarAutomator:
             if not messages[0]:
                 logger.debug("No new matching emails found")
                 return
+                
             email_ids = messages[0].split()
             logger.info(f"Found {len(email_ids)} new matching emails")
+            
             for email_id in email_ids:
                 email_id_str = email_id.decode() if isinstance(email_id, bytes) else email_id
-                # Skip if already processed in this session
                 if email_id_str in self.processed_emails:
                     logger.debug(f"Skipping already processed email {email_id_str}")
                     continue
+                    
+                # Refresh cache for each email to get most recent events
+                caldav_events = self.get_caldav_events(self.caldav_calendar) if self.caldav_calendar else []
+                google_events = self.get_google_events(self.google_service) if self.google_service else []
+                
                 try:
                     # Fetch email
                     status, msg_data = mail.fetch(email_id, '(RFC822)')
@@ -378,9 +720,43 @@ class EmailCalendarAutomator:
                     # Parse with AI
                     event_data = self.parse_email_with_ai(subject, body, sender)
                     if event_data:
+                        # Convert ISO strings to datetime objects for comparison
+                        try:
+                            start_dt = datetime.fromisoformat(event_data['start_date'].replace('Z', '+00:00'))
+                            end_dt = datetime.fromisoformat(event_data['end_date'].replace('Z', '+00:00'))
+                            event_data['start_date'] = start_dt
+                            event_data['end_date'] = end_dt
+                        except Exception as e:
+                            logger.error(f"Error parsing event dates: {e}")
+                            continue
+                            
+                        # Check for similar existing events
+                        similar_events = self.find_similar_events(
+                            event_data, 
+                            caldav_events if CONFIG['ENABLE_CALDAV'] else None,
+                            google_events if CONFIG['ENABLE_GOOGLE_CALENDAR'] else None
+                        )
+                        
+                        if similar_events:
+                            logger.info(f"Found {len(similar_events)} similar existing events")
+                            # Update the most similar event
+                            most_similar = similar_events[0]
+                            updated = False
+                            
+                            if most_similar['type'] == 'caldav' and CONFIG['ENABLE_CALDAV'] and self.caldav_calendar:
+                                updated = self.update_caldav_event(self.caldav_calendar, most_similar['event'], event_data)
+                            elif most_similar['type'] == 'google' and CONFIG['ENABLE_GOOGLE_CALENDAR'] and self.google_service:
+                                updated = self.update_google_event(self.google_service, most_similar['event'], event_data)
+                                
+                            if updated:
+                                logger.info(f"Updated existing event instead of creating new one: {event_data['title']}")
+                                self.processed_emails.add(email_id_str)
+                                if CONFIG['MARK_AS_PROCESSED']:
+                                    mail.store(email_id, '+FLAGS', '\\Seen')
+                                continue  # Skip creating new event
+                        
                         success_caldav = False
                         success_google = False
-                        
                         # Create calendar event in CalDAV (if enabled and available)
                         if CONFIG['ENABLE_CALDAV'] and self.caldav_calendar:
                             success_caldav = self.create_calendar_event(self.caldav_calendar, event_data)
@@ -388,7 +764,6 @@ class EmailCalendarAutomator:
                             logger.warning("CalDAV calendar not available, skipping CalDAV event creation")
                         elif not CONFIG['ENABLE_CALDAV']:
                             logger.info("CalDAV is disabled, skipping CalDAV event creation")
-
                         # Create calendar event in Google Calendar (if enabled and available)
                         if CONFIG['ENABLE_GOOGLE_CALENDAR'] and self.google_service:
                             try:
@@ -400,7 +775,6 @@ class EmailCalendarAutomator:
                             logger.warning("Google Calendar not available, skipping Google event creation")
                         elif not CONFIG['ENABLE_GOOGLE_CALENDAR']:
                             logger.info("Google Calendar is disabled, skipping Google event creation")
-
                         if success_caldav or success_google:
                             logger.info(f"Successfully processed email and synced to available calendars: {subject}")
                             self.processed_emails.add(email_id_str)
@@ -474,25 +848,53 @@ class EmailCalendarAutomator:
     def create_google_event(self, service, event_data):
         """Create an event in Google Calendar"""
         try:
+            # First, check if similar event already exists
+            time_min = event_data['start_date'] - timedelta(days=1)
+            time_max = event_data['end_date'] + timedelta(days=1)
+            google_events = self.get_google_events(service, time_min, time_max)
+            
+            if self.is_event_duplicate(event_data, google_events):
+                logger.info(f"Skipping duplicate Google event creation: {event_data['title']}")
+                return True
+
             calendar_id = self.get_calendar_id_by_name(service, CONFIG['GOOGLE_CALENDAR_NAME'])
+            
+            # Handle datetime objects
             start_dt = event_data['start_date']
             end_dt = event_data['end_date']
+            
+            if isinstance(start_dt, datetime):
+                start_iso = start_dt.isoformat()
+            else:
+                start_iso = start_dt
+            if isinstance(end_dt, datetime):
+                end_iso = end_dt.isoformat()
+            else:
+                end_iso = end_dt
+                
             event_body = {
                 'summary': event_data['title'],
                 'start': {
-                    'dateTime': start_dt,
+                    'dateTime': start_iso,
                     'timeZone': CONFIG['TIMEZONE'],
                 },
                 'end': {
-                    'dateTime': end_dt,
+                    'dateTime': end_iso,
                     'timeZone': CONFIG['TIMEZONE'],
                 },
             }
+            
             if event_data.get('location'):
                 event_body['location'] = event_data['location']
             if event_data.get('description'):
                 event_body['description'] = event_data['description']
+                
             event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
+            
+            # Track the event ID
+            if event.get('id'):
+                self.created_event_uids.add(event.get('id'))
+                
             logger.info(f"Google Calendar event created: {event.get('htmlLink')} in calendar '{CONFIG['GOOGLE_CALENDAR_NAME']}'")
             return True
         except Exception as e:
@@ -554,7 +956,6 @@ def main():
     try:
         logger.info("Email-to-Calendar Automation starting up...")
         logger.info("Checking connections at startup based on configuration...")
-        
         # Test Gmail connection
         try:
             logger.info("Testing Gmail connection...")
@@ -565,7 +966,6 @@ def main():
         except Exception as e:
             logger.critical(f"✗ Failed to connect to Gmail: {e}")
             return 1
-
         # Test CalDAV connection if enabled
         if CONFIG['ENABLE_CALDAV']:
             try:
@@ -596,7 +996,6 @@ def main():
                 return 1
         else:
             logger.info("CalDAV is disabled via ENABLE_CALDAV=false")
-
         # Test Google Calendar connection if enabled
         if CONFIG['ENABLE_GOOGLE_CALENDAR']:
             try:
@@ -610,9 +1009,7 @@ def main():
                 return 1
         else:
             logger.info("Google Calendar is disabled via ENABLE_GOOGLE_CALENDAR=false")
-
         logger.info("All enabled connections successful! Starting automation...")
-        
         # Start the automation
         automator = EmailCalendarAutomator()
         # Run once or continuously based on environment variable
