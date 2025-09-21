@@ -8,6 +8,10 @@ services:
       - ./google_credentials.json:/app/credentials/google_credentials.json:ro
       - ./google_token.json:/app/credentials/google_token.json:rw
     env_file: .env
+    # Optional: For first-run without google_token.json
+    # ports:
+    #   - "5353:5353"
+    
     # Optional: enable if you want logs visible in real-time
     # logging:
     #   driver: "json-file"
