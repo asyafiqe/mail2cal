@@ -40,6 +40,10 @@ services:
       - ./google_credentials.json:/app/credentials/google_credentials.json:ro
       - ./google_token.json:/app/credentials/google_token.json:rw
     env_file: .env
+    # Optional: For first-run without google_token.json
+    # ports:
+    #   - "5353:5353"
+
     # Optional: enable if you want logs visible in real-time
     # logging:
     #   driver: "json-file"
@@ -47,6 +51,16 @@ services:
     #     max-size: "10m"
     #     max-file: "3"
 ```
+#### First-Time Setup
+
+**If you don't have `google_token.json`:**
+1. Ensure port `5353` is exposed in your docker-compose configuration (as shown above)
+2. Start the container: `docker compose up -d`
+3. Check container logs: `docker compose logs -f mail2cal`
+4. When prompted, open your browser and navigate to `http://localhost:5353` to complete Google OAuth authentication
+5. The `google_token.json` file will be automatically created in your current directory
+6. On subsequent runs, the container will use the existing token file
+     
 
 > 🔹 Make sure `google_credentials.json` and `.env` are in the same directory.
 
